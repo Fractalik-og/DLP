@@ -3,6 +3,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using DLP.UsbController.Enums;
 using Microsoft.Win32;
+using Microsoft.Win32.SafeHandles;
 
 namespace DLP.UsbController.Services
 {
