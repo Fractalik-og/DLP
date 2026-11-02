@@ -17,6 +17,13 @@ namespace DLP.UsbController
         private readonly AgentViewModel _vm;
         private readonly IIncidentLogger _logger;
 
+        // События агента приходят из фоновых потоков (WMI, Task.Run), в том числе
+        // ДО создания дескриптора окна — Invoke/BeginInvoke в этот момент бросает
+        // InvalidOperationException. Поэтому маршалинг откладывается до OnHandleCreated.
+        private readonly Queue<Action> _pendingUiActions = new();
+        private bool _uiReady;
+        private readonly object _pendingLock = new();
+
         private NotifyIcon _tray = null!;
         private ToolStripMenuItem _miShowLog = null!;
         private ContextMenuStrip _trayMenu = null!;
@@ -31,11 +38,65 @@ namespace DLP.UsbController
         {
             _vm = vm;
             _logger = logger;
-            _vm.UiMarshal = action => Invoke(action); // все события VM → в UI-поток
+            // Безопасный маршалинг в UI-поток: если дескриптор окна ещё не создан,
+            // действие ставится в очередь и будет выполнено в OnHandleCreated.
+            _vm.UiMarshal = MarshalToUi;
 
             BuildUi();
             Bind();
+        }
+
+        /// <summary>
+        /// Маршалинг делегата в поток UI. Устраняет гонку: события агента могут
+        /// прийти раньше, чем у формы появится оконный дескриптор (Handle).
+        /// </summary>
+        private void MarshalToUi(Action action)
+        {
+            if (action is null) return;
+
+            lock (_pendingLock)
+            {
+                if (!_uiReady || !IsHandleCreated)
+                {
+                    _pendingUiActions.Enqueue(action);
+                    return;
+                }
+            }
+
+            try
+            {
+                if (InvokeRequired) BeginInvoke(action);
+                else action();
+            }
+            catch (ObjectDisposedException)
+            {
+                // Окно закрылось во время асинхронного события — игнорируем.
+            }
+            catch (InvalidOperationException)
+            {
+                // Дескриптор уничтожен между проверкой и вызовом — игнорируем.
+            }
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+
+            // Дескриптор создан — можно безопасно выполнять накопленные события
+            // и инициализировать трей/запуск агента (InitTray вызывает _vm.Start()).
             InitTray();
+
+            List<Action> pending;
+            lock (_pendingLock)
+            {
+                _uiReady = true;
+                pending = new List<Action>(_pendingUiActions);
+                _pendingUiActions.Clear();
+            }
+            foreach (var a in pending)
+            {
+                try { a(); } catch { /* не роняем окно из-за устаревшего события */ }
+            }
         }
 
         private void BuildUi()
@@ -115,8 +176,8 @@ namespace DLP.UsbController
 
             _vm.PropertyChanged += (_, e) =>
             {
-                if (InvokeRequired) { BeginInvoke(() => ApplyVmState(e.PropertyName)); }
-                else ApplyVmState(e.PropertyName);
+                // Тот же безопасный путь: без прямого BeginInvoke до создания Handle.
+                MarshalToUi(() => ApplyVmState(e.PropertyName));
             };
             ApplyVmState(null);
         }
