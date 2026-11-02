@@ -1,6 +1,6 @@
 ﻿namespace DLP.UsbController
 {
-    partial class Form1
+    partial class MainForm
     {
         /// <summary>
         ///  Required designer variable.
@@ -30,8 +30,14 @@
         {
             components = new System.ComponentModel.Container();
             AutoScaleMode = AutoScaleMode.Font;
-            ClientSize = new Size(800, 450);
-            Text = "Form1";
+            ClientSize = new Size(1000, 640);
+            Text = "DLP USB Analyzer";
+            StartPosition = FormStartPosition.CenterScreen;
+
+            // Порядок добавления важен для Dock: Fill раньше, чем Top/Lower.
+            Controls.Add(_grid);       // Dock.Fill
+            Controls.Add(_toolStrip);  // Dock.Top
+            Controls.Add(_statusStrip);// Dock.Bottom
         }
 
         #endregion
