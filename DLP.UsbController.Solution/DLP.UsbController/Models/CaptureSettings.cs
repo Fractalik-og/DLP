@@ -7,10 +7,11 @@ namespace DLP.UsbController.Models
     /// </summary>
     public class CaptureSettings
     {
-        /// <summary>Фильтры захвата (пустой список = захватывать всё).</summary>
-        public IReadOnlyList<CaptureFilter> Filters { get; }
-            => _filters.AsReadOnly();
         private readonly List<CaptureFilter> _filters = new();
+        private readonly List<string> _ports = new();
+
+        /// <summary>Фильтры захвата (пустой список = захватывать всё).</summary>
+        public IReadOnlyList<CaptureFilter> Filters => _filters.AsReadOnly();
 
         /// <summary>Максимальный размер буфера захвата, МБ.</summary>
         public int BufferSizeMb { get; set; } = 512;
@@ -28,9 +29,7 @@ namespace DLP.UsbController.Models
         public CaptureFilter? StopTrigger { get; set; }
 
         /// <summary>Интерфейсы/порты анализатора (для многопортовых устройств, напр. Total Phase Aardvark).</summary>
-        public IReadOnlyList<string> Ports { get; }
-            => _ports.AsReadOnly();
-        private readonly List<string> _ports = new();
+        public IReadOnlyList<string> Ports => _ports.AsReadOnly();
 
         public void AddFilter(CaptureFilter filter)
         {

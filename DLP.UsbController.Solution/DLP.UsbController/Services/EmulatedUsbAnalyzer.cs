@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using DLP.UsbController.Enums;
 using DLP.UsbController.Interfaces;
 using DLP.UsbController.Models;
@@ -13,6 +14,7 @@ namespace DLP.UsbController.Services
     {
         private readonly CancellationTokenSource _cts = new();
         private readonly Random _rng = new();
+        private CancellationTokenSource? _captureCts;
         private Task? _captureLoop;
         private long _sequence;
         private AnalyzerStatus _status = AnalyzerStatus.Disconnected;
@@ -46,21 +48,26 @@ namespace DLP.UsbController.Services
             _paused = false;
             SetStatus(AnalyzerStatus.Capturing, "Захват запущен");
 
-            _captureLoop = Task.Run(() => CaptureLoopAsync(settings, MergeToken(cancellationToken)), cancellationToken);
+            _captureCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, cancellationToken);
+            var token = _captureCts.Token;
+            _captureLoop = Task.Run(() => CaptureLoopAsync(settings, token), token);
             return Task.CompletedTask;
         }
 
         public async Task StopCaptureAsync()
         {
             var loop = _captureLoop;
+            var cts = _captureCts;
             _captureLoop = null;
+            _captureCts = null;
 
             if (loop is not null)
             {
                 // Останавливаем поток генерации через токен захвата.
-                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(loop.GetCancellationToken());
+                cts?.Cancel();
                 try { await Task.WhenAny(loop, Task.Delay(TimeSpan.FromSeconds(2))); }
                 catch (OperationCanceledException) { /* игнорируем */ }
+                finally { cts?.Dispose(); }
             }
 
             if (_status is AnalyzerStatus.Capturing or AnalyzerStatus.Paused)
@@ -76,7 +83,8 @@ namespace DLP.UsbController.Services
             return Task.CompletedTask;
         }
 
-        public async IAsyncEnumerable<UsbPacket> ReadPacketsAsync(CancellationToken cancellationToken = default)
+        public async IAsyncEnumerable<UsbPacket> ReadPacketsAsync(
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
             // В эмуляторе пакеты отдаются только через событие PacketCaptured.
             // У реальной реализации здесь читается DMA/кольцевой буфер драйвера.
@@ -100,9 +108,6 @@ namespace DLP.UsbController.Services
 
         // ---------- внутренняя логика эмуляции ----------
 
-        private CancellationToken MergeToken(CancellationToken external) =>
-            CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, external).Token;
-
         private async Task CaptureLoopAsync(CaptureSettings settings, CancellationToken token)
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -110,7 +115,8 @@ namespace DLP.UsbController.Services
             {
                 if (_paused)
                 {
-                    await Task.Delay(100, token).ContinueWith(_ => { });
+                    try { await Task.Delay(100, token); }
+                    catch (OperationCanceledException) { break; }
                     continue;
                 }
 
@@ -118,7 +124,8 @@ namespace DLP.UsbController.Services
                 if (PassesFilters(packet, settings))
                     PacketCaptured?.Invoke(this, new PacketCapturedEventArgs(packet));
 
-                await Task.Delay(_rng.Next(1, 40), token).ContinueWith(_ => { });
+                try { await Task.Delay(_rng.Next(1, 40), token); }
+                catch (OperationCanceledException) { break; }
             }
         }
 

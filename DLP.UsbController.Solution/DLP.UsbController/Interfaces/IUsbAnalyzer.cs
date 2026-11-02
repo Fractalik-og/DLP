@@ -41,6 +41,11 @@ namespace DLP.UsbController.Interfaces
         Task SetPausedAsync(bool paused);
 
         /// <summary>Прочитать накопленные пакеты из буфера (для последующей обработки/экспорта).</summary>
+        /// <remarks>
+        /// Реализациям-итераторам (async IAsyncEnumerable) необходимо пометить параметр
+        /// атрибутом [EnumeratorCancellation], чтобы токен, переданный в GetAsyncEnumerator(),
+        /// корректно доходил до тела итератора.
+        /// </remarks>
         IAsyncEnumerable<UsbPacket> ReadPacketsAsync(CancellationToken cancellationToken = default);
 
         /// <summary>Экспорт захвата в файл (например, .csv или бинарный дамп).</summary>
