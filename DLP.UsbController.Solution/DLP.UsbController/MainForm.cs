@@ -97,7 +97,14 @@ namespace DLP.UsbController
             _viewModel.PropertyChanged += (_, e) =>
             {
                 // События приходят из фоновых потоков — маршалим в UI-поток.
-                if (InvokeRequired) { BeginInvoke(() => UpdateUi(e.PropertyName)); }
+                // BeginInvoke недопустим до создания дескриптора окна, поэтому
+                // проверяем IsHandleCreated и выполняем напрямую в UI-потоке.
+                if (IsHandleCreated && InvokeRequired)
+                {
+                    try { BeginInvoke(() => UpdateUi(e.PropertyName)); }
+                    catch (ObjectDisposedException) { }
+                    catch (InvalidOperationException) { }
+                }
                 else UpdateUi(e.PropertyName);
             };
 
