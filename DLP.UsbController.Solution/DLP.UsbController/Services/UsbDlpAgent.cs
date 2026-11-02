@@ -22,6 +22,7 @@ namespace DLP.UsbController.Services
         private readonly SemaphoreSlim _processGate = new(1, 1);
         private CancellationTokenSource? _runCts;
         private bool _started;
+        private RemovableDeviceEventArgs? _lastArrival; // для ручного повторного скана из UI
 
         public event EventHandler<ScanSessionSummary>? SessionUpdated;
         public event EventHandler<string>? ActivityLogged;
@@ -66,8 +67,16 @@ namespace DLP.UsbController.Services
 
         private void OnDeviceArrived(object? sender, RemovableDeviceEventArgs e)
         {
+            _lastArrival = e;
             foreach (var vol in e.Volumes)
                 _ = HandleArrivalAsync(vol, e.Device);
+        }
+
+        /// <summary>Ручной запуск проверки выбранного устройства из интерфейса.</summary>
+        public Task RescanLastDeviceAsync()
+        {
+            var e = _lastArrival ?? throw new InvalidOperationException("Устройства ещё не подключались.");
+            return e.Volumes.Count > 0 ? HandleArrivalAsync(e.Volumes[0], e.Device) : Task.CompletedTask;
         }
 
         private void OnDeviceRemoved(object? sender, RemovableDeviceEventArgs e)
@@ -104,13 +113,27 @@ namespace DLP.UsbController.Services
                 summary.Stage = DeviceProcessingStage.Enforcing;
                 if (_policy.DefaultAction is EnforcementAction.SetReadOnly or EnforcementAction.QuarantineFiles)
                 {
-                    bool ro = await _enforcement.SetReadOnlyAsync(volume.DeviceId, volume.SerialNumber)
-                                                  .ConfigureAwait(false);
+                    // Многоуровневая мера: реестр + НЕМЕДЛЕННАЯ блокировка записи уже
+                    // смонтированного тома + policy-ключ (см. UsbWriteControl).
+                    string roDetail;
+                    bool ro;
+                    if (_enforcement is RegistryEnforcementModule rem)
+                    {
+                        ro = await rem.SetReadOnlyAsync(volume.DeviceId, volume.SerialNumber, volume.DriveLetter)
+                                      .ConfigureAwait(false);
+                        roDetail = rem.LastReadOnlyDetail ?? "";
+                    }
+                    else
+                    {
+                        ro = await _enforcement.SetReadOnlyAsync(volume.DeviceId, volume.SerialNumber)
+                                              .ConfigureAwait(false);
+                        roDetail = ro ? "Режим только чтение применён." : "Мера не применена.";
+                    }
                     Notify(summary, ro
-                        ? $"Том {volume.DriveLetter} переведён в режим «только чтение» (реестр WriteProtect=1)."
-                        : $"Не удалось изменить реестр (нет прав?) — том {volume.DriveLetter} остаётся доступным для записи.");
+                        ? $"Том {volume.DriveLetter}: запись ограничена. {roDetail}"
+                        : $"Не удалось ограничить запись на {volume.DriveLetter} (нужен запуск от администратора). {roDetail}");
                     await LogSimpleAsync("EnforcementReadOnly", ro ? IncidentSeverity.Medium : IncidentSeverity.High,
-                        ro ? "Установлен режим только чтение." : "Попытка установки R/O не удалась (требуется elevated).",
+                        (ro ? "Установлен режим только чтение. " : "Попытка установки R/O не удалась (требуется elevated). ") + roDetail,
                         volume, EnforcementAction.SetReadOnly).ConfigureAwait(false);
                 }
 
@@ -209,9 +232,9 @@ namespace DLP.UsbController.Services
         private async Task HandleRemovalAsync(RemovableVolumeInfo volume)
         {
             // Устройство извлечено — снимаем ограничение реестра, логируем событие.
-            bool restored = await _enforcement
-                .RestoreReadWriteAsync(volume.DeviceId, volume.SerialNumber)
-                .ConfigureAwait(false);
+            bool restored = _enforcement is RegistryEnforcementModule remR
+                ? await remR.RestoreReadWriteAsync(volume.DeviceId, volume.SerialNumber, volume.DriveLetter).ConfigureAwait(false)
+                : await _enforcement.RestoreReadWriteAsync(volume.DeviceId, volume.SerialNumber).ConfigureAwait(false);
 
             await LogSimpleAsync("DeviceRemoval", IncidentSeverity.Info,
                 $"Том {volume.DriveLetter} отключён. Права записи восстановлены: {(restored ? "да" : "нет/не требовалось")}.",

@@ -68,4 +68,23 @@ namespace DLP.UsbController.Enums
         High,
         Critical,
     }
+
+    /// <summary>Состояние USB-устройства в интерфейсе агента (паттерн State).</summary>
+    public enum DeviceState
+    {
+        /// <summary>Устройство обнаружено, ожидает обработки.</summary>
+        Connected = 0,
+        /// <summary>Выполняется обход и анализ файлов.</summary>
+        Scanning,
+        /// <summary>Проверено, нарушений нет — разрешено.</summary>
+        Allowed,
+        /// <summary>Запись ограничена (режим «только чтение»).</summary>
+        Blocked,
+        /// <summary>Обнаружены конфиденциальные файлы, часть изъята в карантин.</summary>
+        Quarantined,
+        /// <summary>Устройство извлечено.</summary>
+        Disconnected,
+        /// <summary>Ошибка обработки (носитель недоступен и т.п.).</summary>
+        Error,
+    }
 }
