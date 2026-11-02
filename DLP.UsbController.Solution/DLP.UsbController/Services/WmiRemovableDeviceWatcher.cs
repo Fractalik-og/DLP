@@ -200,21 +200,46 @@ namespace DLP.UsbController.Services
                     string pnp = disk["PNPDeviceID"] as string ?? "";
                     var id = TryParseVidPid(pnp);
                     string? sn = (disk["SerialNumber"] as string)?.Trim();
+                    string? diskInstance = disk["DeviceID"] as string;
 
-                    // Win32_Associators: диск → разделы → логические диски.
-                    using var assoc = new ManagementObjectSearcher(
-                        $"ASSOCIATORS OF {{Win32_DiskDrive.DeviceID='{disk["DeviceID"]}'}} WHERE AssocClass=Win32_DiskDriveToDiskPartition");
-                    foreach (ManagementObject part in assoc.Get())
+                    // Диск → разделы → логические диски (буква тома).
+                    var letters = new List<string>();
+                    if (diskInstance is not null)
                     {
-                        using var logs = new ManagementObjectSearcher(
-                            $"ASSOCIATORS OF {{Win32_DiskPartition.DeviceID='{part["DeviceID"]}'}} WHERE AssocClass=Win32_LogicalDiskToPartition");
-                        foreach (ManagementObject log in logs.Get())
+                        using var assoc = new ManagementObjectSearcher(
+                            $"ASSOCIATORS OF {{Win32_DiskDrive.DeviceID='{diskInstance}'}} WHERE AssocClass=Win32_DiskDriveToDiskPartition");
+                        foreach (ManagementObject part in assoc.Get())
                         {
-                            var letter = log["DeviceID"] as string;
-                            if (!string.IsNullOrEmpty(letter))
-                                diskByLetter[letter] = (id, string.IsNullOrWhiteSpace(sn) ? null : sn, pnp);
+                            using var logs = new ManagementObjectSearcher(
+                                $"ASSOCIATORS OF {{Win32_DiskPartition.DeviceID='{part["DeviceID"]}'}} WHERE AssocClass=Win32_LogicalDiskToPartition");
+                            foreach (ManagementObject log in logs.Get())
+                            {
+                                var letter = log["DeviceID"] as string;
+                                if (!string.IsNullOrEmpty(letter)) letters.Add(letter);
+                            }
                         }
                     }
+
+                    // Резервная привязка: если цепочка ассоциаций не сработала (бывает для FAT32/exFAT),
+                    // сопоставляем USB-диски со съёмными логическими дисками по порядку.
+                    if (letters.Count == 0 && pnp.Length > 0)
+                    {
+                        try
+                        {
+                            using var mp = new ManagementObjectSearcher(
+                                @"SELECT DeviceID FROM Win32_LogicalDisk WHERE DriveType=2");
+                            foreach (ManagementObject d in mp.Get())
+                            {
+                                var letter = d["DeviceID"] as string;
+                                if (!string.IsNullOrEmpty(letter) && !letters.Contains(letter))
+                                    letters.Add(letter);
+                            }
+                        }
+                        catch (ManagementException) { /* игнорируем */ }
+                    }
+
+                    foreach (var letter in letters)
+                        diskByLetter.TryAdd(letter, (id, string.IsNullOrWhiteSpace(sn) ? null : sn, pnp));
                 }
 
                 // 2. Съёмные тома.

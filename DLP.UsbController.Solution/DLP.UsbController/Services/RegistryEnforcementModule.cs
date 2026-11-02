@@ -25,9 +25,15 @@ namespace DLP.UsbController.Services
         private const string WriteProtectValueName = "WriteProtect";
 
         private readonly DlpPolicyConfig _policy;
+        private readonly UsbWriteControl? _writeControl;
+        private readonly QuarantineStore? _quarantineStore;
         private readonly Dictionary<string, DeviceWritePolicyState> _states = new(StringComparer.OrdinalIgnoreCase);
         private bool _disposed;
 
+        /// <summary>Последний детальный результат применения R/O (для журнала/UI).</summary>
+        public string? LastReadOnlyDetail { get; private set; }
+
+        /// <summary>Текст уведомления, которым подменяется изъятый файл на носителе.</summary>
         public string StubTemplate { get; set; } =
             "██████████████████████████████████████████████████████████████\r\n" +
             "  ВНИМАНИЕ! Файл изъят агентом DLP-системы.\r\n" +
@@ -38,37 +44,74 @@ namespace DLP.UsbController.Services
             "  Инцидент: {incidentId}. Для возврата обратитесь к администратору ИБ.\r\n" +
             "██████████████████████████████████████████████████████████████\r\n";
 
-        public RegistryEnforcementModule(DlpPolicyConfig policy) => _policy = policy;
+        /// <param name="writeControl">Модуль немедленной блокировки записи (UsbWriteControl).
+        /// Если передан — применяется многоуровневая схема (реестр + блокировка тома + политика),
+        /// дающая эффект на УЖЕ смонтированной флешке без переподключения.</param>
+        /// <param name="quarantineStore">Реестр карантина для вкладки «Карантин» (метаданные Q-xxxxx.json).</param>
+        public RegistryEnforcementModule(DlpPolicyConfig policy, UsbWriteControl? writeControl = null, QuarantineStore? quarantineStore = null)
+        {
+            _policy = policy;
+            _writeControl = writeControl;
+            _quarantineStore = quarantineStore;
+        }
 
-        public Task<bool> SetReadOnlyAsync(UsbDeviceId deviceId, string? serialNumber, CancellationToken cancellationToken = default)
+        // ---- Расширенный контракт с привязкой к букве тома (немедленный эффект) ----
+        public Task<bool> SetReadOnlyAsync(UsbDeviceId deviceId, string? serialNumber, string? driveLetter, CancellationToken cancellationToken = default)
         {
             string key = StateKey(deviceId, serialNumber);
             if (!_states.TryGetValue(key, out var state))
                 state = _states[key] = new DeviceWritePolicyState { DeviceId = deviceId, SerialNumber = serialNumber };
+
+            // Многоуровневый механизм: реестр + немедленная блокировка тома + policy-ключ.
+            if (_writeControl is not null && !string.IsNullOrWhiteSpace(driveLetter))
+            {
+                var res = _writeControl.MakeVolumeReadOnly(driveLetter);
+                LastReadOnlyDetail = res.Detail;
+                state.IsReadOnlyNow = res.Success;
+                state.AppliedAtUtc = DateTime.UtcNow;
+                return Task.FromResult(res.ImmediateLockApplied || res.RegistryApplied);
+            }
 
             bool ok = TryModifyRegistry(value =>
             {
                 state.OriginalWriteProtectValue ??= value;      // запоминаем исходное значение один раз
                 return 1;                                       // WriteProtect = 1 → только чтение
             });
+            LastReadOnlyDetail = ok
+                ? "Реестр WriteProtect=1 применён (эффект при следующем подключении)."
+                : "Нет elevated-доступа к реестру — режим не изменён.";
 
             state.IsReadOnlyNow = ok;
             state.AppliedAtUtc = DateTime.UtcNow;
             return Task.FromResult(ok);
         }
 
-        public Task<bool> RestoreReadWriteAsync(UsbDeviceId deviceId, string? serialNumber, CancellationToken cancellationToken = default)
+        public Task<bool> RestoreReadWriteAsync(UsbDeviceId deviceId, string? serialNumber, string? driveLetter, CancellationToken cancellationToken = default)
         {
+            if (_writeControl is not null && !string.IsNullOrWhiteSpace(driveLetter))
+            {
+                var res = _writeControl.RestoreVolumeReadWrite(driveLetter);
+                LastReadOnlyDetail = res.Detail;
+            }
+
             string key = StateKey(deviceId, serialNumber);
-            if (!_states.TryGetValue(key, out var state)) return Task.FromResult(false);
+            if (!_states.TryGetValue(key, out var state)) return Task.FromResult(_writeControl is not null);
 
             int? original = state.OriginalWriteProtectValue;
             bool ok = TryModifyRegistry(_ => original ?? 0);
 
             state.IsReadOnlyNow = false;
             state.RestoredAtUtc = DateTime.UtcNow;
-            return Task.FromResult(ok);
+            return Task.FromResult(ok || _writeControl is not null);
         }
+
+        // ---- Контракт IEnforcementModule (без буквы тома — только реестр) ----
+
+        Task<bool> IEnforcementModule.SetReadOnlyAsync(UsbDeviceId deviceId, string? serialNumber, CancellationToken cancellationToken) =>
+            SetReadOnlyAsync(deviceId, serialNumber, driveLetter: null, cancellationToken);
+
+        Task<bool> IEnforcementModule.RestoreReadWriteAsync(UsbDeviceId deviceId, string? serialNumber, CancellationToken cancellationToken) =>
+            RestoreReadWriteAsync(deviceId, serialNumber, driveLetter: null, cancellationToken);
 
         /// <summary>
         /// Чтение/модификация параметра реестра. Возвращает false, если ключ недоступен
@@ -113,32 +156,53 @@ namespace DLP.UsbController.Services
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 if (!File.Exists(path)) continue;
+                if (_quarantineStore?.IsQuarantined(path) == true) continue; // файл уже изъят ранее
 
                 var fi = new FileInfo(path);
                 string qName = $"{Sanitize(fi.Name)}.{Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(path))[..4])}.qdata";
                 string qPath = Path.Combine(sessionDir, qName);
 
                 // 1. Копируем оригинал в карантин, считаем SHA-256.
-                string sha;
+                byte[] hash;
                 await using (var src = fi.OpenRead())
                 await using (var dst = File.Create(qPath))
                 {
                     using var sha256 = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-                    var hash = await sha256.ComputeHashAsync(src, cancellationToken).ConfigureAwait(false);
-                    sha = Convert.ToHexString(hash);
+                    hash = await sha256.ComputeHashAsync(src, cancellationToken).ConfigureAwait(false);
                     src.Position = 0;
                     await src.CopyToAsync(dst, cancellationToken).ConfigureAwait(false);
                 }
-                // Проверяем подпись карантина отдельным хешем пути+данных (упрощённо — метаданные рядом).
-                await File.WriteAllTextAsync(qPath + ".meta",
-                    $"path={path}\r\nsha256={sha}\r\nsize={fi.Length}\r\nutc={DateTime.UtcNow:o}\r\n",
-                    cancellationToken).ConfigureAwait(false);
+                string sha = Convert.ToHexString(hash);
 
                 // 2. Подмена оригинала файлом-заглушкой с уведомлением.
                 findingsByFile.TryGetValue(path, out var findings);
-                string stubText = BuildStub(path, qPath, findings ?? []);
+                findings ??= [];
+                string incidentId = _quarantineStore?.NextIncidentId() ?? Guid.NewGuid().ToString("N");
+                string stubText = BuildStub(path, qPath, findings, incidentId);
                 TryRemoveReadOnly(path);
-                await File.WriteAllTextAsync(path, stubText, Encoding.UTF8, cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    await File.WriteAllTextAsync(path, stubText, Encoding.UTF8, cancellationToken).ConfigureAwait(false);
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    // Том переведён в «только чтение» — заглушку не записать. Это корректное
+                    // поведение меры принуждения: файл фиксируется на месте без изъятия.
+                }
+
+                // 3. Регистрация метаданных Q-xxxxx.json для вкладки «Карантин».
+                _quarantineStore?.Register(
+                    originalPath: path,
+                    storedDataFile: qPath,
+                    sha256: hash,
+                    sizeBytes: fi.Length,
+                    policy: "USB-DLP-01",
+                    categories: findings.Select(f => f.Category.ToString()),
+                    markers: findings.Select(f => f.MaskedMatch),
+                    incidentId: incidentId,
+                    device: GetDriveOf(path),
+                    serial: null,
+                    drive: GetDriveOf(path));
 
                 records.Add(new QuarantineRecord
                 {
@@ -147,21 +211,27 @@ namespace DLP.UsbController.Services
                     StubFilePath = path,
                     Sha256Original = sha,
                     SizeBytes = fi.Length,
-                    Findings = findings ?? [],
+                    Findings = findings,
                 });
             }
 
             return records;
         }
 
-        private string BuildStub(string originalPath, string quarantinePath, IReadOnlyList<ContentFinding> findings)
+        private static string GetDriveOf(string path)
+        {
+            try { return Path.GetPathRoot(path) ?? ""; }
+            catch (ArgumentException) { return ""; }
+        }
+
+        private string BuildStub(string originalPath, string quarantinePath, IReadOnlyList<ContentFinding> findings, string incidentId)
         {
             var cats = findings.Select(f => f.Category).Distinct().OrderBy(x => x);
             return StubTemplate
                 .Replace("{policy}", "USB-DLP-01")
                 .Replace("{categories}", string.Join(", ", cats.Any() ? cats : new[] { "Keyword" }))
                 .Replace("{quarantinePath}", quarantinePath)
-                .Replace("{incidentId}", Guid.NewGuid().ToString("N"))
+                .Replace("{incidentId}", incidentId)
                 + $"\r\nФайл: {originalPath}\r\nНайдено фрагментов: {findings.Count}\r\n";
         }
 
@@ -200,6 +270,7 @@ namespace DLP.UsbController.Services
                     state.RestoredAtUtc = DateTime.UtcNow;
                 }
             }
+            _writeControl?.Dispose();   // закрываем дескрипторы заблокированных томов
         }
     }
 
