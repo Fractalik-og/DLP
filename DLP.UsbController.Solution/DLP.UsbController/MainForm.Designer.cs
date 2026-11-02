@@ -29,15 +29,21 @@
         private void InitializeComponent()
         {
             components = new System.ComponentModel.Container();
-            AutoScaleMode = AutoScaleMode.Font;
-            ClientSize = new Size(1000, 640);
-            Text = "DLP USB Analyzer";
-            StartPosition = FormStartPosition.CenterScreen;
+            SuspendLayout();
 
-            // Порядок добавления важен для Dock: Fill раньше, чем Top/Lower.
-            Controls.Add(_grid);       // Dock.Fill
-            Controls.Add(_toolStrip);  // Dock.Top
-            Controls.Add(_statusStrip);// Dock.Bottom
+            // Свойства формы (параметризованы, чтобы не конфликтовать с типом AutoScaleMode).
+            this.AutoScaleMode = AutoScaleMode.Font;
+            this.ClientSize = new Size(1000, 640);
+            this.Text = "DLP USB Analyzer";
+            this.StartPosition = FormStartPosition.CenterScreen;
+
+            // Порядок добавления важен для Dock: Fill добавляется раньше, чем Top/Bottom.
+            this.Controls.Add(_grid);       // Dock.Fill
+            this.Controls.Add(_toolStrip);  // Dock.Top
+            this.Controls.Add(_statusStrip);// Dock.Bottom
+
+            ResumeLayout(false);
+            PerformLayout();
         }
 
         #endregion

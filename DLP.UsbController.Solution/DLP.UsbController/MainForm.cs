@@ -10,7 +10,7 @@ namespace DLP.UsbController
     /// Главное окно USB-анализатора.
     /// Layout: панель инструментов сверху, таблица пакетов в центре, статус-бар снизу.
     /// </summary>
-    public partial class MainForm
+    public partial class MainForm : Form
     {
         private readonly MainViewModel _viewModel;
 
@@ -136,9 +136,11 @@ namespace DLP.UsbController
                 await _viewModel.ExportAsync(dlg.FileName);
         }
 
-        protected override async void OnFormClosed(FormClosedEventArgs e)
+        protected override void OnFormClosed(FormClosedEventArgs e)
         {
-            await _viewModel.DisposeAsync();
+            // Асинхронную очистку запускаем «огонь и забудь»: к моменту закрытия окна
+            // это последний шанс корректно остановить анализатор.
+            _ = _viewModel.DisposeAsync().AsTask();
             base.OnFormClosed(e);
         }
     }

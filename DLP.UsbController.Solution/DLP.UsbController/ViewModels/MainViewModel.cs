@@ -137,12 +137,13 @@ namespace DLP.UsbController.ViewModels
 
         private void OnPacketCaptured(object? sender, PacketCapturedEventArgs e)
         {
-            _store.Add(in e.Packet);
+            var packet = e.Packet; // копия: by-ref нельзя передать из свойства события
+            _store.Add(in packet);
 
             // Обновляем UI не чаще, чем каждый N-й пакет — иначе DataGridView «ляжет».
             if (++_uiRefreshCounter % 20 != 0) return;
 
-            var row = UsbPacketRow.From(e.Packet);
+            var row = UsbPacketRow.From(in packet);
             VisiblePackets.Add(row);
 
             const int maxVisibleRows = 5000;
