@@ -209,8 +209,9 @@ namespace DLP.UsbController.Services
             if (!OperatingSystem.IsWindows()) return false;
             try
             {
+                // WindowsPrincipal не реализует IDisposable — его нельзя помещать в using.
                 using var id = System.Security.Principal.WindowsIdentity.GetCurrent();
-                using var p = new System.Security.Principal.WindowsPrincipal(id);
+                var p = new System.Security.Principal.WindowsPrincipal(id);
                 return p.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
             }
             catch { return false; }

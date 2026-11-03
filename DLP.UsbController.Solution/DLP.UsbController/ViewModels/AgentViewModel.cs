@@ -52,7 +52,7 @@ namespace DLP.UsbController.ViewModels
         public bool IsElevated => UsbWriteControl.IsElevated();
 
         public DlpPolicyConfig Policy { get; }
-        public string QuarantineDirectory => _quarantineStore?.Directory ?? Policy.QuarantineDirectory;
+        public string QuarantineDirectory => _quarantineStore?.RootDirectory ?? Policy.QuarantineDirectory;
 
         public AgentViewModel(
             UsbDlpAgent agent,
