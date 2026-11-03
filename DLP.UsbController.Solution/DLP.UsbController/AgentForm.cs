@@ -7,10 +7,8 @@ using DLP.UsbController.ViewModels;
 namespace DLP.UsbController
 {
     /// <summary>
-    /// Главное окно DLP-агента контроля съёмных USB-накопителей.
-    ///  - работает в системном трее (NotifyIcon) с индикатором состояния;
-    ///  - показывает активные сессии сканирования, журнал активности, статистику;
-    ///  - детализированный журнал инцидентов открывается двойным кликом по трею/кнопкой.
+    /// Окно DLP-агента (компактная версия): одна таблица носителей, журнал активности,
+    /// карантин и статус-бар. Все подписи в интерфейсе — на русском.
     /// </summary>
     public sealed class AgentForm : Form
     {
@@ -25,13 +23,13 @@ namespace DLP.UsbController
         private readonly object _pendingLock = new();
 
         private NotifyIcon _tray = null!;
-        private ToolStripMenuItem _miShowLog = null!;
         private ContextMenuStrip _trayMenu = null!;
-        private DataGridView _gridSessions = null!;
+        private DataGridView _gridDevices = null!, _gridQuarantine = null!;
         private ListBox _listActivity = null!;
-        private Button _btnStart = null!, _btnStop = null!, _btnLog = null!;
+        private Button _btnStart = null!, _btnStop = null!, _btnLog = null!, _btnOpenQ = null!, _btnRefreshQ = null!;
         private StatusStrip _status = null!;
         private ToolStripStatusLabel _lblStatus = null!, _lblStats = null!;
+        private TabControl _tabs = null!;
         private bool _reallyClose;
 
         public AgentForm(AgentViewModel vm, IIncidentLogger logger)
@@ -68,22 +66,14 @@ namespace DLP.UsbController
                 if (InvokeRequired) BeginInvoke(action);
                 else action();
             }
-            catch (ObjectDisposedException)
-            {
-                // Окно закрылось во время асинхронного события — игнорируем.
-            }
-            catch (InvalidOperationException)
-            {
-                // Дескриптор уничтожен между проверкой и вызовом — игнорируем.
-            }
+            catch (ObjectDisposedException) { /* окно закрылось — игнорируем */ }
+            catch (InvalidOperationException) { /* дескриптор уничтожен — игнорируем */ }
         }
 
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
 
-            // Дескриптор создан — можно безопасно выполнять накопленные события
-            // и инициализировать трей/запуск агента (InitTray вызывает _vm.Start()).
             InitTray();
 
             List<Action> pending;
@@ -99,86 +89,116 @@ namespace DLP.UsbController
             }
         }
 
+        // ============================ ИНТЕРФЕЙС ============================
+
         private void BuildUi()
         {
-            Text = "DLP USB Agent — контроль съёмных носителей";
+            Text = "DLP-агент: контроль USB-накопителей";
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(980, 620);
-            MinimumSize = new Size(720, 460);
+            ClientSize = new Size(860, 520);
+            MinimumSize = new Size(640, 400);
 
-            var topPanel = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 40, Padding = new Padding(6) };
-            _btnStart = new Button { Text = "▶ Запустить агент", AutoSize = true };
-            _btnStop = new Button { Text = "⏹ Остановить", AutoSize = true };
-            _btnLog = new Button { Text = "📄 Журнал инцидентов", AutoSize = true };
+            var topPanel = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 38, Padding = new Padding(6, 6, 6, 2) };
+            _btnStart = new Button { Text = "Запустить", AutoSize = true };
+            _btnStop = new Button { Text = "Остановить", AutoSize = true };
+            _btnLog = new Button { Text = "Журнал инцидентов", AutoSize = true };
             topPanel.Controls.AddRange([_btnStart, _btnStop, _btnLog]);
 
-            var split = new SplitContainer
+            _tabs = new TabControl { Dock = DockStyle.Fill };
+            var tabDevices = new TabPage("Носители") { Padding = new Padding(3) };
+            var tabQuarantine = new TabPage("Карантин") { Padding = new Padding(3) };
+            var tabActivity = new TabPage("Журнал работы") { Padding = new Padding(3) };
+            _tabs.TabPages.AddRange([tabDevices, tabQuarantine, tabActivity]);
+
+            // --- вкладка «Носители»: одна таблица + кнопки мер ---
+            _gridDevices = NewGrid(_vm.Devices);
+            AddCols(_gridDevices,
+                ("DriveLetter", "Том", 90),
+                ("StatusText", "Состояние", 170),
+                ("FindingsTextRu", "Находок", 90),
+                ("LastAction", "Действие", 320),
+                ("StartedText", "Время", 90));
+
+            var devButtons = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 34, Padding = new Padding(4) };
+            var btnRescan = new Button { Text = "Пересканировать", AutoSize = true };
+            var btnBlock = new Button { Text = "Блокировать запись", AutoSize = true };
+            var btnUnblock = new Button { Text = "Разблокировать", AutoSize = true };
+            btnRescan.Click += async (_, _) => await RescanAsync();
+            btnBlock.Click += (_, _) => RunOnDevice(_vm.BlockDevice);
+            btnUnblock.Click += (_, _) => RunOnDevice(_vm.UnblockDevice);
+            devButtons.Controls.AddRange([btnRescan, btnBlock, btnUnblock]);
+
+            tabDevices.Controls.Add(_gridDevices);
+            tabDevices.Controls.Add(devButtons);
+
+            // --- вкладка «Карантин» ---
+            _gridQuarantine = NewGrid(_vm.Quarantine);
+            AddCols(_gridQuarantine,
+                ("Id", "Номер", 90),
+                ("OriginalName", "Файл", 220),
+                ("StoredFileName", "В карантине", 200),
+                ("SizeText", "Размер", 80),
+                ("QuarantinedLocalText", "Изъят", 120));
+
+            var qButtons = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 34, Padding = new Padding(4) };
+            _btnOpenQ = new Button { Text = "Открыть папку карантина", AutoSize = true };
+            _btnRefreshQ = new Button { Text = "Обновить список", AutoSize = true };
+            _btnOpenQ.Click += (_, _) => OpenQuarantineFolder();
+            _btnRefreshQ.Click += (_, _) => _vm.ReloadQuarantine();
+            qButtons.Controls.AddRange([_btnOpenQ, _btnRefreshQ]);
+
+            tabQuarantine.Controls.Add(_gridQuarantine);
+            tabQuarantine.Controls.Add(qButtons);
+
+            // --- вкладка «Журнал работы» ---
+            _listActivity = new ListBox
             {
                 Dock = DockStyle.Fill,
-                Orientation = Orientation.Vertical,
-                SplitterDistance = 560,
+                IntegralHeight = false,
+                Font = new Font("Consolas", 9f),
+                DataSource = _vm.ActivityLog,
             };
-
-            _gridSessions = new DataGridView
-            {
-                Dock = DockStyle.Fill,
-                ReadOnly = true,
-                AllowUserToAddRows = false,
-                RowHeadersVisible = false,
-                AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
-                SelectionMode = DataGridViewSelectionMode.FullRowSelect,
-                DataSource = _vm.Sessions,
-            };
-            ConfigureSessionColumns();
-
-            var actLabel = new Label { Text = "Журнал активности агента:", Dock = DockStyle.Top, Height = 22, Padding = new Padding(4, 4, 0, 0) };
-            _listActivity = new ListBox { Dock = DockStyle.Fill, IntegralHeight = false, Font = new Font("Consolas", 9f) };
-            _listActivity.DataSource = _vm.ActivityLog;
-
-            split.Panel1.Controls.Add(_gridSessions);
-            split.Panel2.Controls.Add(_listActivity);
-            split.Panel2.Controls.Add(actLabel);
+            tabActivity.Controls.Add(_listActivity);
 
             _status = new StatusStrip();
             _lblStatus = new ToolStripStatusLabel("Агент остановлен") { Spring = true, TextAlign = ContentAlignment.MiddleLeft };
             _lblStats = new ToolStripStatusLabel("") { AutoSize = true };
             _status.Items.AddRange([_lblStatus, _lblStats]);
 
-            Controls.Add(split);
+            Controls.Add(_tabs);
             Controls.Add(topPanel);
             Controls.Add(_status);
         }
 
-        private void ConfigureSessionColumns()
+        private static DataGridView NewGrid(object dataSource) => new()
         {
-            _gridSessions.Columns.Clear();
-            AddCol(nameof(ScanSessionSummaryRow.DriveLetter), "Том");
-            AddCol(nameof(ScanSessionSummaryRow.DeviceId), "VID/PID");
-            AddCol(nameof(ScanSessionSummaryRow.Serial), "SN");
-            AddCol(nameof(ScanSessionSummaryRow.Stage), "Стадия");
-            AddCol(nameof(ScanSessionSummaryRow.FilesScanned), "Файлов");
-            AddCol(nameof(ScanSessionSummaryRow.Findings), "Находок");
-            AddCol(nameof(ScanSessionSummaryRow.Action), "Мера");
-            AddCol(nameof(ScanSessionSummaryRow.StartedLocal), "Начало");
-        }
+            Dock = DockStyle.Fill,
+            ReadOnly = true,
+            AllowUserToAddRows = false,
+            RowHeadersVisible = false,
+            AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None,
+            SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+            AllowUserToResizeRows = false,
+            DataSource = dataSource,
+        };
 
-        private void AddCol(string prop, string header)
+        private static void AddCols(DataGridView grid, params (string Prop, string Header, int Width)[] cols)
         {
-            int idx = _gridSessions.Columns.Add(prop, header);
-            if (idx >= 0) _gridSessions.Columns[idx].FillWeight = header.Length * 12 + 30;
+            grid.Columns.Clear();
+            foreach (var (prop, header, width) in cols)
+            {
+                int idx = grid.Columns.Add(prop, header);
+                if (idx >= 0) grid.Columns[idx].Width = width;
+            }
         }
 
         private void Bind()
         {
-            _btnStart.Click += (_, _) => { _vm.Start(); };
+            _btnStart.Click += (_, _) => _vm.Start();
             _btnStop.Click += async (_, _) => await _vm.StopAsync();
             _btnLog.Click += (_, _) => ShowLog();
 
-            _vm.PropertyChanged += (_, e) =>
-            {
-                // Тот же безопасный путь: без прямого BeginInvoke до создания Handle.
-                MarshalToUi(() => ApplyVmState(e.PropertyName));
-            };
+            _vm.PropertyChanged += (_, e) => MarshalToUi(() => ApplyVmState(e.PropertyName));
             ApplyVmState(null);
         }
 
@@ -187,42 +207,97 @@ namespace DLP.UsbController
             _btnStart.Enabled = _vm.CanStart;
             _btnStop.Enabled = _vm.CanStop;
             _lblStatus.Text = _vm.StatusText;
-            _lblStats.Text = $"Инцидентов: {_vm.Incidents.Count} · Находок: {_vm.TotalFindings} · " +
-                             $"В карантине: {_vm.QuarantinedFiles} · Отправлено на центр: {_vm.DeliveredIncidents}";
+            _lblStats.Text = $"Инцидентов: {_vm.Incidents.Count} · Находок: {_vm.TotalFindings} · В карантине: {_vm.QuarantinedFiles}";
 
             _tray?.Icon = _vm.IsRunning ? SystemIcons.Shield : SystemIcons.Warning;
-            _tray?.Text = _vm.IsRunning
-                ? "DLP USB Agent: мониторинг активен"
-                : "DLP USB Agent: остановлен";
+            _tray?.Text = _vm.IsRunning ? "DLP-агент: наблюдение включено" : "DLP-агент: остановлен";
         }
+
+        // ============================ ДЕЙСТВИЯ ============================
+
+        private string SelectedDrive() =>
+            _gridDevices.CurrentRow?.DataBoundItem is DeviceRow r ? r.DriveLetter : "";
+
+        private void RunOnDevice(Func<string, string> action)
+        {
+            string drive = SelectedDrive();
+            if (string.IsNullOrEmpty(drive))
+            {
+                Info("Сначала выберите строку с носителем.");
+                return;
+            }
+            Info(action(drive));
+        }
+
+        private async Task RescanAsync()
+        {
+            try
+            {
+                await _vm.RescanSelectedAsync();
+            }
+            catch (InvalidOperationException)
+            {
+                Info("Устройства ещё не подключались.");
+            }
+        }
+
+        private void OpenQuarantineFolder()
+        {
+            string dir = _vm.QuarantineDirectory;
+            try
+            {
+                if (!System.IO.Directory.Exists(dir)) System.IO.Directory.CreateDirectory(dir);
+                var psi = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = dir,
+                    UseShellExecute = OperatingSystem.IsWindows(),
+                };
+                if (!OperatingSystem.IsWindows())
+                {
+                    // вне Windows — просто открываем путь в проводнике ОС песочницы, если он есть
+                    psi.FileName = "xdg-open";
+                    psi.ArgumentList.Add(dir);
+                }
+                System.Diagnostics.Process.Start(psi);
+            }
+            catch (Exception ex)
+            {
+                Info($"Не удалось открыть папку: {ex.Message}\nПуть: {dir}");
+            }
+        }
+
+        private void Info(string text) =>
+            MessageBox.Show(this, text, "DLP-агент", MessageBoxButtons.OK, MessageBoxIcon.Information);
+
+        // ============================ ТРЕЙ / ЖУРНАЛ ============================
 
         private void InitTray()
         {
             _trayMenu = new ContextMenuStrip();
-            _miShowLog = new ToolStripMenuItem("Журнал событий…");
-            _miShowLog.Click += (_, _) => { ShowWindow(); ShowLog(); };
-            var miStart = new ToolStripMenuItem("Запустить мониторинг");
+            var miLog = new ToolStripMenuItem("Журнал событий…");
+            miLog.Click += (_, _) => { ShowWindow(); ShowLog(); };
+            var miStart = new ToolStripMenuItem("Запустить наблюдение");
             miStart.Click += (_, _) => _vm.Start();
             var miStop = new ToolStripMenuItem("Остановить");
             miStop.Click += async (_, _) => await _vm.StopAsync();
             var miExit = new ToolStripMenuItem("Выход");
             miExit.Click += (_, _) => CloseAgent();
 
-            _trayMenu.Items.AddRange([_miShowLog, new ToolStripSeparator(), miStart, miStop, new ToolStripSeparator(), miExit]);
+            _trayMenu.Items.AddRange([miLog, new ToolStripSeparator(), miStart, miStop, new ToolStripSeparator(), miExit]);
 
             _tray = new NotifyIcon
             {
                 Icon = SystemIcons.Warning,
-                Text = "DLP USB Agent: остановлен",
+                Text = "DLP-агент: остановлен",
                 Visible = true,
                 ContextMenuStrip = _trayMenu,
             };
             _tray.DoubleClick += (_, _) => { ShowWindow(); ShowLog(); };
 
-            // В демо-режиме (не Windows) сразу запускаем агента, чтобы трей «ожил».
+            // Стартуем агент сразу, чтобы конвейер «обнаружение → скан → карантин» был виден.
             _vm.Start();
-            _tray.BalloonTipTitle = "DLP USB Agent";
-            _tray.BalloonTipText = "Мониторинг съёмных USB-накопителей запущен.";
+            _tray.BalloonTipTitle = "DLP-агент";
+            _tray.BalloonTipText = "Наблюдение за USB-накопителями запущено.";
             _tray.ShowBalloonTip(3000);
         }
 
@@ -243,12 +318,12 @@ namespace DLP.UsbController
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
-            // Крестик ≠ выход: сворачиваемся в трей (классика агентов безопасности).
+            // Крестик ≠ выход: сворачиваемся в трей.
             if (!_reallyClose && e.CloseReason == CloseReason.UserClosing)
             {
                 e.Cancel = true;
                 Hide();
-                _tray.BalloonTipTitle = "DLP USB Agent";
+                _tray.BalloonTipTitle = "DLP-агент";
                 _tray.BalloonTipText = "Агент продолжает работу в системном трее.";
                 _tray.ShowBalloonTip(2000);
                 return;
@@ -260,17 +335,14 @@ namespace DLP.UsbController
         {
             _reallyClose = true;
             _vm.StopAsync().GetAwaiter().GetResult();
-            DisposeAgentResources();
-            Close();
-        }
-
-        private void DisposeAgentResources()
-        {
             _tray.Visible = false;
             _tray.Dispose();
             _trayMenu.Dispose();
             GC.SuppressFinalize(_logger); // логгер живёт дольше окна — закрывает Program
+            Close();
         }
+
+        // ============================ СОСТАВ OKНА ============================
 
         public static AgentForm CreateForDemo(DlpPolicyConfig policy, IIncidentLogger logger)
         {
@@ -294,9 +366,11 @@ namespace DLP.UsbController
                 : new SimulatedRemovableDeviceWatcher(demoRoot);
 
             var scanner = new ContentScanner(effectivePolicy);
-            var enforcement = new RegistryEnforcementModule(effectivePolicy);
+            var quarantineStore = new QuarantineStore(quarantine);
+            var writeControl = new UsbWriteControl();
+            var enforcement = new RegistryEnforcementModule(effectivePolicy, writeControl, quarantineStore);
             var agent = new UsbDlpAgent(watcher, scanner, enforcement, logger, effectivePolicy);
-            var vm = new AgentViewModel(agent, logger, effectivePolicy);
+            var vm = new AgentViewModel(agent, logger, effectivePolicy, quarantineStore, writeControl, enforcement);
             return new AgentForm(vm, logger);
         }
     }

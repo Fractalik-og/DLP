@@ -53,11 +53,15 @@ namespace DLP.UsbController.Services
         [JsonPropertyName("quarantined_at_utc")]
         public DateTime QuarantinedAtUtc { get; set; } = DateTime.UtcNow;
 
+        /// <summary>Имя файла в карантине (то, что реально лежит на диске).</summary>
+        [JsonIgnore]
+        public string StoredFileName => Path.GetFileName(StoredFile);
+
         [JsonIgnore]
         public string SizeText => FormatSize(SizeBytes);
 
         [JsonIgnore]
-        public DateTime QuarantinedLocal => QuarantinedAtUtc.ToLocalTime();
+        public string QuarantinedLocalText => QuarantinedAtUtc.ToLocalTime().ToString("dd.MM.yyyy HH:mm");
 
         public static string FormatSize(long bytes) => bytes switch
         {
