@@ -9,7 +9,7 @@ namespace DLP.UsbController.ViewModels
 {
     /// <summary>
     /// ViewModel окна DLP-агента: состояние агента для статус-бара/трея, журнал активности,
-    /// список инцидентов, таблица устройств (паттерн State) и содержимое карантина.
+    /// одна таблица подключённых носителей и содержимое карантина.
     /// </summary>
     public sealed class AgentViewModel : INotifyPropertyChanged, IAsyncDisposable
     {
@@ -23,7 +23,6 @@ namespace DLP.UsbController.ViewModels
 
         public BindingList<string> ActivityLog { get; } = [];
         public BindingList<SecurityIncident> Incidents { get; } = [];
-        public BindingList<ScanSessionSummaryRow> Sessions { get; } = [];
         public BindingList<DeviceRow> Devices { get; } = [];
         public BindingList<QuarantineEntry> Quarantine { get; } = [];
 
@@ -72,17 +71,12 @@ namespace DLP.UsbController.ViewModels
             _agent.ActivityLogged += (_, msg) => OnUi(() =>
             {
                 ActivityLog.Insert(0, msg);
-                while (ActivityLog.Count > 500) ActivityLog.RemoveAt(ActivityLog.Count - 1);
+                while (ActivityLog.Count > 300) ActivityLog.RemoveAt(ActivityLog.Count - 1);
             });
 
             _agent.SessionUpdated += (_, s) => OnUi(() =>
             {
-                var row = Sessions.FirstOrDefault(r => r.DriveLetter == s.Volume.DriveLetter);
-                if (row is null) Sessions.Insert(0, ScanSessionSummaryRow.From(s));
-                else row.Update(s);
-                while (Sessions.Count > 50) Sessions.RemoveAt(Sessions.Count - 1);
-
-                // Таблица устройств: состояние по паттерну State.
+                // Одна таблица устройств вместо двух (сессии + устройства).
                 var dev = Devices.FirstOrDefault(d => d.DriveLetter == s.Volume.DriveLetter);
                 if (dev is null)
                 {
@@ -115,7 +109,7 @@ namespace DLP.UsbController.ViewModels
         {
             _agent.Start();
             IsRunning = true;
-            StatusText = $"Агент работает. Политика: {Policy.DefaultAction}, режим запуска: {(IsElevated ? "администратор" : "обычный пользователь")}";
+            StatusText = $"Агент работает. Режим: {Policy.DefaultAction.Text()}, запуск: {(IsElevated ? "от администратора" : "обычный")}";
         }
 
         public async Task StopAsync()
@@ -191,50 +185,15 @@ namespace DLP.UsbController.ViewModels
         }
     }
 
-    /// <summary>Плоская строка сессии сканирования для DataGridView.</summary>
-    public sealed class ScanSessionSummaryRow
-    {
-        public string DriveLetter { get; init; } = "";
-        public string DeviceId { get; init; } = "";
-        public string Serial { get; init; } = "";
-        public string Stage { get; set; } = "";
-        public int FilesScanned { get; set; }
-        public int Findings { get; set; }
-        public string Action { get; set; } = "";
-        public DateTime StartedLocal { get; init; }
-
-        public static ScanSessionSummaryRow From(ScanSessionSummary s)
-        {
-            var r = new ScanSessionSummaryRow
-            {
-                DriveLetter = s.Volume.DriveLetter,
-                DeviceId = s.Volume.DeviceId.ToString(),
-                Serial = s.Volume.SerialNumber ?? "—",
-                StartedLocal = s.StartedAtUtc.ToLocalTime(),
-            };
-            r.Update(s);
-            return r;
-        }
-
-        public void Update(ScanSessionSummary s)
-        {
-            Stage = s.Stage.ToString();
-            FilesScanned = s.FilesScanned;
-            Findings = s.FindingsTotal;
-            Action = s.ActionApplied == EnforcementAction.None ? "—" : s.ActionApplied.ToString();
-        }
-    }
-
-    /// <summary>Плоская строка таблицы «Устройства» с состоянием по паттерну State.</summary>
+    /// <summary>
+    /// Плоская строка таблицы «Носители»: одно устройство = одна строка,
+    /// состояние — по паттерну State (русский текст из [Description]).
+    /// </summary>
     public sealed class DeviceRow : INotifyPropertyChanged
     {
         public event PropertyChangedEventHandler? PropertyChanged;
 
         public string DriveLetter { get; init; } = "";
-        public string DeviceName { get; init; } = "";
-        public string VidPid { get; init; } = "";
-        public string Serial { get; init; } = "—";
-        public string FileSystem { get; init; } = "";
         public UsbDeviceId DeviceId { get; init; }
         public string? SerialRaw { get; init; }
 
@@ -255,41 +214,23 @@ namespace DLP.UsbController.ViewModels
         public int FilesScanned { get; set; }
         public int Findings { get; set; }
 
-        private DateTime _lastSeenLocal = DateTime.Now;
-        public DateTime LastSeenLocal
-        {
-            get => _lastSeenLocal;
-            set { _lastSeenLocal = value; OnChanged(nameof(LastSeenLocal)); }
-        }
-
-        public string StateText => State switch
-        {
-            DeviceState.Connected => "Подключено",
-            DeviceState.Scanning => "Сканируется",
-            DeviceState.Allowed => "Разрешено",
-            DeviceState.Blocked => "Заблокировано (только чтение)",
-            DeviceState.Quarantined => "Карантин",
-            DeviceState.Disconnected => "Отключено",
-            DeviceState.Error => "Ошибка",
-            _ => State.ToString(),
-        };
+        // ---- готовые к показу значения (столбцы таблицы) ----
+        public string StatusText => State.Text();
+        public string FindingsTextRu => Findings > 0 ? Findings.ToString() : "—";
+        public string StartedText { get; set; } = "";
 
         public static DeviceRow From(ScanSessionSummary s) => new()
         {
             DriveLetter = s.Volume.DriveLetter,
-            DeviceName = $"{s.Volume.VolumeLabel ?? "USB Drive"}",
-            VidPid = s.Volume.DeviceId.ToString(),
-            Serial = s.Volume.SerialNumber ?? "—",
-            SerialRaw = s.Volume.SerialNumber,
-            FileSystem = s.Volume.FileSystem,
             DeviceId = s.Volume.DeviceId,
+            SerialRaw = s.Volume.SerialNumber,
+            StartedText = s.StartedAtUtc.ToLocalTime().ToString("HH:mm:ss"),
         };
 
         public void Update(ScanSessionSummary s)
         {
             FilesScanned = s.FilesScanned;
             Findings = s.FindingsTotal;
-            LastSeenLocal = DateTime.Now;
             State = s.Stage switch
             {
                 DeviceProcessingStage.Scanning or DeviceProcessingStage.Detected or DeviceProcessingStage.MatchingVolumes => DeviceState.Scanning,
@@ -299,17 +240,13 @@ namespace DLP.UsbController.ViewModels
                 _ => DeviceState.Connected,
             };
             if (s.FindingsTotal > 0 && s.Stage is DeviceProcessingStage.Enforcing or DeviceProcessingStage.Completed)
-                LastAction = $"Найдено фрагментов: {s.FindingsTotal}, изъято в карантин";
+                LastAction = $"Изъято в карантин: {s.FindingsTotal}";
             else if (s.Stage == DeviceProcessingStage.Scanning) LastAction = "Обход файлов…";
             else if (s.Stage == DeviceProcessingStage.Failed) LastAction = s.LastError ?? "Ошибка обработки";
-            else if (s.Stage == DeviceProcessingStage.Completed) LastAction = "Проверка завершена, нарушений нет";
-            OnPropertyChanged();
-        }
+            else if (s.Stage == DeviceProcessingStage.Completed) LastAction = "Нарушений нет";
 
-        private void OnPropertyChanged()
-        {
-            OnChanged(nameof(FilesScanned));
-            OnChanged(nameof(Findings));
+            OnChanged(nameof(StatusText));
+            OnChanged(nameof(FindingsTextRu));
         }
 
         private void OnChanged([CallerMemberName] string? name = null) =>

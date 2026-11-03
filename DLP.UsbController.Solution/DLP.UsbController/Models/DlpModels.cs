@@ -127,6 +127,28 @@ namespace DLP.UsbController.Models
         public IncidentDeliveryStatus DeliveryStatus { get; set; } = IncidentDeliveryStatus.Queued;
         public DateTime? DeliveredAtUtc { get; set; }
         public string? DeliveryError { get; set; }
+
+        // ---- текстовые значения для таблицы журнала (в UI не показываем служебное) ----
+
+        /// <summary>Тип события по-русски.</summary>
+        public string EventTextRu => EventType switch
+        {
+            "DeviceAllowed" => "Разрешено",
+            "EnforcementReadOnly" => "Блокировка записи",
+            "ScanClean" => "Чисто",
+            "PolicyViolation" => "Нарушение политики",
+            "DeviceRemoval" => "Отключено",
+            "AgentError" => "Ошибка",
+            _ => EventType,
+        };
+
+        /// <summary>Время локальное, для столбца «Время».</summary>
+        public string TimeText => Timestamp.ToLocalTime().ToString("dd.MM.yyyy HH:mm:ss");
+
+        public string SeverityTextRu => Severity.Text();
+        public string ActionTextRu => ActionApplied == EnforcementAction.None ? "—" : ActionApplied.Text();
+        public string DeliveryTextRu => DeliveryStatus.Text();
+        public string FindingsTextRu => FindingsCount > 0 ? FindingsCount.ToString() : "—";
     }
 
     /// <summary>Сводка по обработанному подключению (для UI).</summary>

@@ -136,6 +136,11 @@ namespace DLP.UsbController.Services
                         (ro ? "Установлен режим только чтение. " : "Попытка установки R/O не удалась (требуется elevated). ") + roDetail,
                         volume, EnforcementAction.SetReadOnly).ConfigureAwait(false);
                 }
+                else
+                {
+                    // Мониторинг без ограничений: меру не показываем в таблице/журнале.
+                    summary.ActionApplied = EnforcementAction.None;
+                }
 
                 // 3. Статический анализ содержимого тома.
                 summary.Stage = DeviceProcessingStage.Scanning;
