@@ -42,6 +42,110 @@ namespace DLP.UsbController.Services
         private readonly Dictionary<string, VolumeLockHandle> _lockedVolumes = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, int?> _originalWriteProtect = new(StringComparer.OrdinalIgnoreCase);
 
+        /// <summary>Точки монтирования (папки), доступ к которым временно перекрыт (незарегистрированные носители).</summary>
+        private readonly HashSet<string> _deniedMounts = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>Закрыть доступ к съёмному тому: немедленная блокировка записи + удаление точки монтирования.</summary>
+        public bool DenyVolumeAccess(string driveLetter)
+        {
+            string normalized = Normalize(driveLetter);
+            MakeVolumeReadOnly(normalized); // удерживаем R/O-дескриптор тома — извлечение/запись блокируются
+
+            // Вне Windows (или для «тома»-папки в демо-режиме) — перекрываем NTFS-правами на чтение.
+            if (!OperatingSystem.IsWindows() || !normalized.Contains(':'))
+                return TryDenyViaAcl(normalized.TrimEnd('\\', ':'));
+
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = "mountvol.exe",
+                    Arguments = $"{normalized.TrimEnd('\\')} /D",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                };
+                using var p = System.Diagnostics.Process.Start(psi);
+                if (p is not null)
+                {
+                    p.WaitForExit(3000);
+                    if (p.ExitCode == 0) { lock (_sync) _deniedMounts.Add(normalized); return true; }
+                }
+            }
+            catch (Exception) { /* нет прав / mountvol недоступен */ }
+            return false;
+        }
+
+        /// <summary>Перекрыть чтение каталога ACL'ом: «Все» — только Special/Deny Read.</summary>
+        private static bool TryDenyViaAcl(string path)
+        {
+            try
+            {
+                if (!Directory.Exists(path)) return false;
+                var sec = new DirectoryInfo(path).GetAccessControl();
+                var deny = new System.Security.AccessControl.FileSystemAccessRule(
+                    new System.Security.Principal.SecurityIdentifier(System.Security.WellKnownSidType.WorldSid, null),
+                    System.Security.AccessControl.FileSystemRights.ReadAndExecute |
+                    System.Security.AccessControl.FileSystemRights.ListDirectory |
+                    System.Security.AccessControl.FileSystemRights.ReadAttributes,
+                    System.Security.AccessControl.InheritanceFlags.ContainerInherit |
+                    System.Security.AccessControl.InheritanceFlags.ObjectInherit,
+                    System.Security.AccessControl.PropagationFlags.None,
+                    System.Security.AccessControl.AccessControlType.Deny);
+                sec.SetAccessRule(deny);
+                new DirectoryInfo(path).SetAccessControl(sec);
+                return true;
+            }
+            catch (Exception) { return false; }
+        }
+
+        /// <summary>Вернуть точку монтирования и снять ACL-запрет (для демо-томов).</summary>
+        public bool RestoreVolumeAccess(string driveLetter)
+        {
+            string normalized = Normalize(driveLetter);
+            lock (_sync) _deniedMounts.Remove(normalized);
+            UnlockVolumeWrite(normalized);
+            bool aclRestored = TryRestoreAcl(normalized.TrimEnd('\\', ':'));
+            bool mountRestored = normalized.Contains(':') ? UnlockVolumeAutoMount() : true;
+            return aclRestored || mountRestored;
+        }
+
+        private static bool TryRestoreAcl(string path)
+        {
+            try
+            {
+                if (!Directory.Exists(path)) return false;
+                var di = new DirectoryInfo(path);
+                var sec = di.GetAccessControl();
+                foreach (var rule in sec.GetAccessRules(true, false, typeof(System.Security.Principal.SecurityIdentifier)))
+                    if (rule is System.Security.AccessControl.FileSystemAccessRule fr &&
+                        fr.AccessControlType == System.Security.AccessControl.AccessControlType.Deny)
+                        sec.RemoveAccessRuleAll(fr);
+                di.SetAccessControl(sec);
+                return true;
+            }
+            catch (Exception) { return false; }
+        }
+
+        private static bool UnlockVolumeAutoMount()
+        {
+            if (!OperatingSystem.IsWindows()) return false;
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = "mountvol.exe",
+                    Arguments = "/S",   // восстановить авто-монтирование всех томов
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                };
+                using var p = System.Diagnostics.Process.Start(psi);
+                p?.WaitForExit(3000);
+                return p is not null && p.ExitCode == 0;
+            }
+            catch (Exception) { return false; }
+        }
+
         /// <summary>Результат применения режима «только чтение» к тому.</summary>
         public sealed record ReadOnlyApplyResult(bool RegistryApplied, bool ImmediateLockApplied, bool PolicyApplied, string Detail)
         {

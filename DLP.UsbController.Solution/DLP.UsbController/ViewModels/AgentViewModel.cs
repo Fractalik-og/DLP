@@ -128,7 +128,7 @@ namespace DLP.UsbController.ViewModels
             if (_enforcement is null) return "Модуль принуждения недоступен.";
             var dev = Devices.FirstOrDefault(d => d.DriveLetter == driveLetter);
             bool ok = _enforcement.SetReadOnlyAsync(
-                dev?.DeviceId ?? new UsbDeviceId(0, 0), dev?.Serial, driveLetter).GetAwaiter().GetResult();
+                dev?.DeviceId ?? new UsbDeviceId(0, 0), dev?.SerialRaw, driveLetter).GetAwaiter().GetResult();
             if (dev is not null && ok) dev.State = DeviceState.Blocked;
             ReloadQuarantine();
             return _enforcement.LastReadOnlyDetail ?? (ok ? "Запись ограничена." : "Мера не применена.");
@@ -201,7 +201,7 @@ namespace DLP.UsbController.ViewModels
         public DeviceState State
         {
             get => _state;
-            set { if (_state != value) { _state = value; OnChanged(nameof(State)); OnChanged(nameof(StateText)); } }
+            set { if (_state != value) { _state = value; OnChanged(nameof(State)); OnChanged(nameof(StatusText)); } }
         }
 
         private string _lastAction = "Подключено";

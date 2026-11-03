@@ -17,12 +17,25 @@ namespace DLP.UsbController.Services
         private readonly IEnforcementModule _enforcement;
         private readonly IIncidentLogger _logger;
         private readonly DlpPolicyConfig _policy;
+        private readonly UsbWriteControl? _accessControl;
+
+        /// <summary>Параметр конструктора: модуль перекрытия доступа к томам (для незарегистрированных носителей).</summary>
+        public UsbWriteControl? VolumeAccessControl => _accessControl;
 
         // Одновременная обработка одного подключения; новые события во время скана — в очередь.
         private readonly SemaphoreSlim _processGate = new(1, 1);
         private CancellationTokenSource? _runCts;
         private bool _started;
         private RemovableDeviceEventArgs? _lastArrival; // для ручного повторного скана из UI
+
+        // ---- постоянный мониторинг зарегистрированных носителей (фоновый опрос) ----
+        private CancellationTokenSource? _watchCts;
+        private Task? _watchTask;
+        private readonly Dictionary<string, HashSet<string>> _knownFiles = new(StringComparer.OrdinalIgnoreCase);
+        private readonly DlpPolicyConfig Policy => _policy;
+
+        /// <summary>Новый файл с конфиденциальной информацией на зарегистрированной флешке.</summary>
+        public event Action<RemovableVolumeInfo, string, IReadOnlyList<ContentFinding>>? SensitiveFileAppeared;
 
         public event EventHandler<ScanSessionSummary>? SessionUpdated;
         public event EventHandler<string>? ActivityLogged;
@@ -35,13 +48,15 @@ namespace DLP.UsbController.Services
             IContentScanner scanner,
             IEnforcementModule enforcement,
             IIncidentLogger logger,
-            DlpPolicyConfig policy)
+            DlpPolicyConfig policy,
+            UsbWriteControl? accessControl = null)
         {
             _watcher = watcher;
             _scanner = scanner;
             _enforcement = enforcement;
             _logger = logger;
             _policy = policy;
+            _accessControl = accessControl;
 
             _watcher.DeviceArrived += OnDeviceArrived;
             _watcher.DeviceRemoved += OnDeviceRemoved;
@@ -53,6 +68,7 @@ namespace DLP.UsbController.Services
             _started = true;
             _runCts = new CancellationTokenSource();
             _watcher.Start();
+            StartVolumeWatch(_runCts.Token);
             ActivityLogged?.Invoke(this, "Агент запущен: мониторинг съёмных носителей активен.");
         }
 
@@ -61,9 +77,112 @@ namespace DLP.UsbController.Services
             if (!_started) return;
             _started = false;
             _runCts?.Cancel();
+            _watchCts?.Cancel();
+            if (_watchTask is not null)
+            {
+                try { await _watchTask.ConfigureAwait(false); }
+                catch (OperationCanceledException) { }
+            }
             await _watcher.StopAsync();
             ActivityLogged?.Invoke(this, "Агент остановлен.");
         }
+
+        // ================= ПОСТОЯННЫЙ МОНИТОРИНГ НОСИТЕЛЕЙ =================
+
+        /// <summary>Фоновый опрос зарегистрированных томов: новые файлы → проверка на конфиденциальность.</summary>
+        private void StartVolumeWatch(CancellationToken ct)
+        {
+            _watchCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            var token = _watchCts.Token;
+            _watchTask = Task.Run(async () =>
+            {
+                while (!token.IsCancellationRequested)
+                {
+                    try
+                    {
+                        foreach (var s in ActiveSessions.Values.Where(s =>
+                                     _policy.IsWhitelisted(s.Volume.DeviceId, s.Volume.SerialNumber)))
+                            await CheckNewFilesAsync(s.Volume, token).ConfigureAwait(false);
+
+                        foreach (var v in await _watcher.GetRemovableVolumesAsync(token).ConfigureAwait(false))
+                            if (_policy.IsWhitelisted(v.DeviceId, v.SerialNumber))
+                                await CheckNewFilesAsync(v, token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) { break; }
+                    catch (Exception) { /* том мог быть извлечён между проверками */ }
+
+                    try { await Task.Delay(TimeSpan.FromSeconds(5), token).ConfigureAwait(false); }
+                    catch (OperationCanceledException) { break; }
+                }
+            }, token);
+        }
+
+        private async Task CheckNewFilesAsync(RemovableVolumeInfo volume, CancellationToken ct)
+        {
+            string root = volume.DriveLetter.EndsWith(':') ? volume.DriveLetter + "\\" : volume.DriveLetter;
+            if (!Directory.Exists(root)) return;
+
+            HashSet<string> known;
+            lock (_knownFiles)
+            {
+                if (!_knownFiles.TryGetValue(volume.DriveLetter, out known!))
+                    _knownFiles[volume.DriveLetter] = known = [];
+            }
+
+            List<string> newFiles = [];
+            try
+            {
+                foreach (var f in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
+                    lock (known)
+                        if (known.Add(f)) newFiles.Add(f);
+            }
+            catch (IOException) { return; }
+            catch (UnauthorizedAccessException) { return; }
+
+            if (newFiles.Count == 0) return;
+
+            foreach (var f in newFiles)
+            {
+                ct.ThrowIfCancellationRequested();
+                FileScanResult res;
+                try
+                {
+                    res = await _scanner.ScanFileAsync(f, Path.GetRelativePath(root, f), ct).ConfigureAwait(false);
+                }
+                catch (IOException) { continue; }
+
+                if (!res.IsCommitted) continue;
+
+                string full = f;
+                NotifyClean($"Внимание! На зарегистрированной флешке {volume.DriveLetter} обнаружен новый файл " +
+                            $"с конфиденциальной информацией:\n• {full}\n" +
+                            $"Находки: {string.Join(", ", res.Findings.Select(x => x.RuleName).Distinct())}");
+                SensitiveFileAppeared?.Invoke(volume, full, res.Findings);
+
+                await LogSimpleAsync("SensitiveFileCopied", IncidentSeverity.High,
+                    $"Перенос конфиденциальных данных: файл {full} записан на зарегистрированный носитель " +
+                    $"{volume.DriveLetter} (SN={volume.SerialNumber}).",
+                    volume, EnforcementAction.None).ConfigureAwait(false);
+            }
+        }
+
+        private void RememberSnapshot(RemovableVolumeInfo volume)
+        {
+            string root = volume.DriveLetter.EndsWith(':') ? volume.DriveLetter + "\\" : volume.DriveLetter;
+            var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                if (Directory.Exists(root))
+                    foreach (var f in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
+                        set.Add(f);
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+            lock (_knownFiles) _knownFiles[volume.DriveLetter] = set;
+        }
+
+        private void NotifyClean(string message) =>
+            ActivityLogged?.Invoke(this, $"[{DateTime.Now:HH:mm:ss}] {message}");
 
         private void OnDeviceArrived(object? sender, RemovableDeviceEventArgs e)
         {
@@ -99,121 +218,92 @@ namespace DLP.UsbController.Services
 
             try
             {
-                // 1. Белый список корпоративных носителей — пропускаем без ограничений.
-                if (_policy.IsWhitelisted(volume.DeviceId, volume.SerialNumber))
+                // 1. Зарегистрированный носитель (белый список): полный доступ + скан содержимого
+                //    с выводом путей файлов, содержащих конфиденциальную информацию.
+                bool registered = _policy.IsWhitelisted(volume.DeviceId, volume.SerialNumber);
+                if (registered)
                 {
                     await LogSimpleAsync("DeviceAllowed", IncidentSeverity.Info,
-                        $"Устройство в белом списке ({volume.DeviceId}, SN={volume.SerialNumber}). Ограничения не применяются.",
+                        $"Флешка зарегистрирована ({volume.DeviceId}, SN={volume.SerialNumber}). Права доступа не ограничиваются.",
                         volume, EnforcementAction.None).ConfigureAwait(false);
+
+                    summary.Stage = DeviceProcessingStage.Scanning;
+                    var regPaths = new List<string>();
+                    string rootR = volume.DriveLetter.EndsWith(':') ? volume.DriveLetter + "\\" : volume.DriveLetter;
+                    await foreach (var res in _scanner.ScanVolumeAsync(volume, null, _runCts?.Token ?? CancellationToken.None)
+                                       .ConfigureAwait(false))
+                    {
+                        foreach (var f in res.Findings)
+                            summary.FindingsByCategory[f.Category] =
+                                summary.FindingsByCategory.GetValueOrDefault(f.Category) + 1;
+                        if (res.IsCommitted)
+                        {
+                            string full = Path.Combine(rootR, res.RelativePath);
+                            regPaths.Add(full);
+                            summary.FindingsTotal += res.Findings.Count;
+                        }
+                    }
+
+                    // Запоминаем снимок файлов — по нему фоновый монитор ловит НОВЫЕ файлы.
+                    RememberSnapshot(volume);
+
+                    if (regPaths.Count > 0)
+                    {
+                        summary.ActionApplied = EnforcementAction.None;
+                        Notify(summary, $"Внимание! В файлах зарегистрированной флешки найдена конфиденциальная информация:\n• " +
+                                        string.Join("\n• ", regPaths));
+                        var incReg = new SecurityIncident
+                        {
+                            EventType = "RegisteredSensitiveFiles",
+                            Severity = IncidentSeverity.High,
+                            VidPid = volume.DeviceId.ToString(),
+                            SerialNumber = volume.SerialNumber,
+                            ProductName = device.ProductName,
+                            Manufacturer = device.Manufacturer,
+                            DriveLetters = volume.DriveLetter,
+                            Description = $"Зарегистрированный носитель {volume.DriveLetter}: в {regPaths.Count} файлах обнаружены " +
+                                          $"паспортные данные/СНИЛС/ИНН/почта/телефон. Пути:\n{string.Join("; ", regPaths)}",
+                            FindingsCount = summary.FindingsTotal,
+                        };
+                        await _logger.LogAsync(incReg).ConfigureAwait(false);
+                        SensitiveFileAppeared?.Invoke(volume, string.Join("\n", regPaths), []);
+                    }
+                    else
+                    {
+                        Notify(summary, $"Зарегистрированная флешка {volume.DriveLetter}: конфиденциальных данных нет.");
+                    }
+
+                    summary.FinishedAtUtc = DateTime.UtcNow;
                     summary.Stage = DeviceProcessingStage.Completed;
                     return;
                 }
 
-                // 2. Немедленно ограничиваем запись, пока идёт анализ (защита от копирования «на лету»).
+                // 2. НЕзарегистрированная флешка: полное ограничение доступа (чтение + запись).
                 summary.Stage = DeviceProcessingStage.Enforcing;
-                if (_policy.DefaultAction is EnforcementAction.SetReadOnly or EnforcementAction.QuarantineFiles)
+                string denyDetail = "";
+                if (_enforcement is RegistryEnforcementModule rem0)
                 {
-                    // Многоуровневая мера: реестр + НЕМЕДЛЕННАЯ блокировка записи уже
-                    // смонтированного тома + policy-ключ (см. UsbWriteControl).
-                    string roDetail;
-                    bool ro;
-                    if (_enforcement is RegistryEnforcementModule rem)
-                    {
-                        ro = await rem.SetReadOnlyAsync(volume.DeviceId, volume.SerialNumber, volume.DriveLetter)
-                                      .ConfigureAwait(false);
-                        roDetail = rem.LastReadOnlyDetail ?? "";
-                    }
-                    else
-                    {
-                        ro = await _enforcement.SetReadOnlyAsync(volume.DeviceId, volume.SerialNumber)
-                                              .ConfigureAwait(false);
-                        roDetail = ro ? "Режим только чтение применён." : "Мера не применена.";
-                    }
-                    Notify(summary, ro
-                        ? $"Том {volume.DriveLetter}: запись ограничена. {roDetail}"
-                        : $"Не удалось ограничить запись на {volume.DriveLetter} (нужен запуск от администратора). {roDetail}");
-                    await LogSimpleAsync("EnforcementReadOnly", ro ? IncidentSeverity.Medium : IncidentSeverity.High,
-                        (ro ? "Установлен режим только чтение. " : "Попытка установки R/O не удалась (требуется elevated). ") + roDetail,
-                        volume, EnforcementAction.SetReadOnly).ConfigureAwait(false);
+                    bool ro0 = await rem0.SetReadOnlyAsync(volume.DeviceId, volume.SerialNumber, volume.DriveLetter)
+                                         .ConfigureAwait(false);
+                    denyDetail = rem0.LastReadOnlyDetail ?? "";
+                    _ = ro0;
                 }
-                else
+                if (_accessControl is not null)
                 {
-                    // Мониторинг без ограничений: меру не показываем в таблице/журнале.
-                    summary.ActionApplied = EnforcementAction.None;
+                    bool denied = _accessControl.DenyVolumeAccess(volume.DriveLetter);
+                    denyDetail += denied
+                        ? " | Доступ к тому перекрыт (чтение и запись запрещены)."
+                        : " | Перекрытие доступа не удалось (нужен запуск от администратора).";
                 }
-
-                // 3. Статический анализ содержимого тома.
-                summary.Stage = DeviceProcessingStage.Scanning;
-                var compromised = new List<FileScanResult>();
-                var findingsByFile = new Dictionary<string, IReadOnlyList<ContentFinding>>(StringComparer.OrdinalIgnoreCase);
-
-                var progress = new Progress<ScanProgress>(p =>
-                {
-                    summary.FilesScanned = p.FilesScanned;
-                    summary.FilesSkipped = p.FilesSkipped;
-                    summary.FindingsTotal = p.FindingsSoFar;
-                    Notify(summary, $"Скан {volume.DriveLetter}: файлов {p.FilesScanned}, находок {p.FindingsSoFar}");
-                });
-
-                string root = volume.DriveLetter.EndsWith(':') ? volume.DriveLetter + "\\" : volume.DriveLetter;
-                await foreach (var res in _scanner.ScanVolumeAsync(volume, progress, _runCts?.Token ?? CancellationToken.None)
-                                   .ConfigureAwait(false))
-                {
-                    foreach (var f in res.Findings)
-                        summary.FindingsByCategory[f.Category] =
-                            summary.FindingsByCategory.GetValueOrDefault(f.Category) + 1;
-
-                    if (res.IsCommitted)
-                    {
-                        compromised.Add(res);
-                        findingsByFile[Path.Combine(root, res.RelativePath)] = res.Findings;
-                    }
-                }
-
-                // 4. Срабатывание политики → меры принуждения.
-                if (compromised.Count > 0)
-                {
-                    summary.ActionApplied = _policy.DefaultAction;
-                    IReadOnlyList<QuarantineRecord> quarantined = [];
-
-                    if (_policy.DefaultAction == EnforcementAction.QuarantineFiles)
-                    {
-                        summary.Stage = DeviceProcessingStage.Enforcing;
-                        quarantined = await _enforcement
-                            .QuarantineFilesAsync(findingsByFile.Keys, findingsByFile, _runCts?.Token ?? CancellationToken.None)
-                            .ConfigureAwait(false);
-                        Notify(summary, $"Карантин: изъято файлов {quarantined.Count}, установлены заглушки.");
-                    }
-
-                    var incident = new SecurityIncident
-                    {
-                        EventType = "PolicyViolation",
-                        Severity = compromised.SelectMany(c => c.Findings).Max(f => f.Severity),
-                        VidPid = volume.DeviceId.ToString(),
-                        SerialNumber = volume.SerialNumber,
-                        ProductName = device.ProductName,
-                        Manufacturer = device.Manufacturer,
-                        DriveLetters = volume.DriveLetter,
-                        Description = $"В файлах тома {volume.DriveLetter} обнаружена конфиденциальная информация " +
-                                      $"({compromised.Sum(c => c.Findings.Count)} фрагментов в {compromised.Count} файлах).",
-                        ActionApplied = _policy.DefaultAction,
-                        FindingsCount = compromised.Sum(c => c.Findings.Count),
-                        Findings = compromised.SelectMany(c => c.Findings).ToArray(),
-                        QuarantinedFiles = quarantined,
-                    };
-                    await _logger.LogAsync(incident).ConfigureAwait(false);
-                    summary.IncidentsLogged++;
-                    Notify(summary, $"Инцидент {incident.Id[..8]} зарегистрирован и поставлен в очередь отправки.");
-                }
-                else
-                {
-                    await LogSimpleAsync("ScanClean", IncidentSeverity.Info,
-                        $"Том {volume.DriveLetter}: конфиденциальной информации не обнаружено.",
-                        volume, EnforcementAction.None).ConfigureAwait(false);
-                }
+                Notify(summary, $"Незарегистрированный носитель {volume.DriveLetter}: доступ ограничен (копирование и чтение запрещены). {denyDetail}");
+                await LogSimpleAsync("UnregisteredBlocked", IncidentSeverity.High,
+                    $"Незарегистрированное устройство ({volume.DeviceId}, SN={volume.SerialNumber}) заблокировано: " +
+                    $"чтение и копирование запрещены.{denyDetail}",
+                    volume, EnforcementAction.SetReadOnly).ConfigureAwait(false);
 
                 summary.FinishedAtUtc = DateTime.UtcNow;
                 summary.Stage = DeviceProcessingStage.Completed;
+                return;
             }
             catch (OperationCanceledException)
             {
@@ -240,6 +330,8 @@ namespace DLP.UsbController.Services
             bool restored = _enforcement is RegistryEnforcementModule remR
                 ? await remR.RestoreReadWriteAsync(volume.DeviceId, volume.SerialNumber, volume.DriveLetter).ConfigureAwait(false)
                 : await _enforcement.RestoreReadWriteAsync(volume.DeviceId, volume.SerialNumber).ConfigureAwait(false);
+
+            lock (_knownFiles) _knownFiles.Remove(volume.DriveLetter);
 
             await LogSimpleAsync("DeviceRemoval", IncidentSeverity.Info,
                 $"Том {volume.DriveLetter} отключён. Права записи восстановлены: {(restored ? "да" : "нет/не требовалось")}.",
