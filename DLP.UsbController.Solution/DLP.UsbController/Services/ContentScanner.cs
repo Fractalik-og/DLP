@@ -24,6 +24,8 @@ namespace DLP.UsbController.Services
         private static readonly Regex SnilsRegex = Snils();
         private static readonly Regex DigitRuns = DigitRunRegex();
         private static readonly Regex PassportRegex = RuPassport();
+        private static readonly Regex EmailRegex = Emails();
+        private static readonly Regex PhoneRegex = Phones();
 
         public IReadOnlyList<ScanRule> Rules { get; }
 
@@ -37,6 +39,8 @@ namespace DLP.UsbController.Services
                 new("INN 10/12 цифр", FindingCategory.PersonalData, IncidentSeverity.Medium, RuleKind.Regex, "inn"),
                 new("Bank card (LUHN)", FindingCategory.Financial, IncidentSeverity.High, RuleKind.Regex, "card"),
                 new("Паспорт РФ серия/номер", FindingCategory.PersonalData, IncidentSeverity.High, RuleKind.Regex, "passport"),
+                new("Электронная почта", FindingCategory.PersonalData, IncidentSeverity.Medium, RuleKind.Regex, "email"),
+                new("Телефон (RU)", FindingCategory.PersonalData, IncidentSeverity.Medium, RuleKind.Regex, "phone"),
             };
             foreach (var (cat, words) in policy.KeywordDictionaries)
                 foreach (var w in words)
@@ -55,6 +59,14 @@ namespace DLP.UsbController.Services
 
         [GeneratedRegex(@"\b[45]\d{2}\s?\d{6}\b")]
         private static partial Regex RuPassport();
+
+        /// <summary>Адреса электронной почты.</summary>
+        [GeneratedRegex(@"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")]
+        private static partial Regex Emails();
+
+        /// <summary>Телефоны РФ: +7/8 и междугородний формат, 10–11 цифр.</summary>
+        [GeneratedRegex(@"(?:\+7|8)[\s(-]?\(?\d{3}\)?[\s-]?\d{3}[\s-]?\d{2}[\s-]?\d{2}\b|\b\+?\d{1,3}[\s-]?\(?\d{3}\)?[\s-]\d{3}[\s-]\d{4}\b")]
+        private static partial Regex Phones();
 
         public async Task<FileScanResult> ScanFileAsync(string fullPath, string relativePath, CancellationToken cancellationToken = default)
         {
@@ -114,6 +126,18 @@ namespace DLP.UsbController.Services
             foreach (Match m in PassportRegex.Matches(line))
                 sink.Add(Find(FindingCategory.PersonalData, "RuPassport", relPath, lineNo, Mask(m.Value), IncidentSeverity.High));
 
+            // Электронная почта (домен маскируется частично).
+            foreach (Match m in EmailRegex.Matches(line))
+                sink.Add(Find(FindingCategory.PersonalData, "Email", relPath, lineNo, MaskEmail(m.Value), IncidentSeverity.Medium));
+
+            // Телефоны: 10–11 цифр с признаками формата РФ.
+            foreach (Match m in PhoneRegex.Matches(line))
+            {
+                var digits = new string(m.Value.Where(char.IsDigit).ToArray());
+                if (digits.Length is 10 or 11 && (digits[0] is '7' or '8' or '9'))
+                    sink.Add(Find(FindingCategory.PersonalData, "Phone", relPath, lineNo, MaskPhone(digits), IncidentSeverity.Medium));
+            }
+
             // 2. Словари ключевых слов.
             foreach (var (cat, words) in _policy.KeywordDictionaries)
                 foreach (var w in words)
@@ -165,6 +189,19 @@ namespace DLP.UsbController.Services
             var d = new string(s.Where(char.IsDigit).ToArray());
             return d.Length < 8 ? Mask(d) : $"{d[..4]} **** **** {d[^4..]}";
         }
+
+        /// <summary>Маска e-mail: иvаn***@corp.local (имя частично скрыто, домен виден).</summary>
+        private static string MaskEmail(string s)
+        {
+            int at = s.IndexOf('@');
+            if (at <= 0) return Mask(s);
+            string local = s[..at], domain = s[at..];
+            return (local.Length <= 2 ? local[0] + "*" : local[..2] + "***") + domain;
+        }
+
+        private static string MaskPhone(string digits) =>
+            digits.Length == 11 ? $"{digits[0]} *** ***-{digits[7..9]}-{digits[9..]}"
+                                : $"+* *** ***-{digits[6..8]}-{digits[8..]}";
 
         private static string ExtractPrintable(byte[] raw)
         {
