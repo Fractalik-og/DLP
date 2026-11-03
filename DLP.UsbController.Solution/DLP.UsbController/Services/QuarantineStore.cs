@@ -87,12 +87,13 @@ namespace DLP.UsbController.Services
         private readonly Dictionary<string, string> _pathToId = new(StringComparer.OrdinalIgnoreCase);
         private int _counter;
 
-        public string Directory { get; }
+        /// <summary>Корневая папка карантина (не скрывать класс System.IO.Directory!).</summary>
+        public string RootDirectory { get; }
 
         public QuarantineStore(string directory)
         {
-            Directory = Path.GetFullPath(directory);
-            Directory.CreateDirectory(Directory);
+            RootDirectory = Path.GetFullPath(directory);
+            System.IO.Directory.CreateDirectory(RootDirectory);
             TryRestrictAccess();
             LoadExistingIds();
         }
@@ -148,7 +149,7 @@ namespace DLP.UsbController.Services
                 Id = id,
                 OriginalName = Path.GetFileName(fullOriginal),
                 OriginalPath = fullOriginal,
-                StoredFile = Path.GetRelativePath(Directory, storedDataFile),
+                StoredFile = Path.GetRelativePath(RootDirectory, storedDataFile),
                 SizeBytes = sizeBytes,
                 Sha256 = Convert.ToHexString(sha256),
                 Policy = policy,
@@ -161,7 +162,7 @@ namespace DLP.UsbController.Services
                 QuarantinedAtUtc = DateTime.UtcNow,
             };
 
-            File.WriteAllText(Path.Combine(Directory, id + ".json"), JsonSerializer.Serialize(entry, MetaOpts));
+            File.WriteAllText(Path.Combine(RootDirectory, id + ".json"), JsonSerializer.Serialize(entry, MetaOpts));
             return entry;
         }
 
@@ -182,8 +183,8 @@ namespace DLP.UsbController.Services
         {
             var entry = FindById(id);
             if (entry is null) return false;
-            TryDelete(Path.Combine(Directory, id + ".json"));
-            TryDelete(Path.GetFullPath(Path.Combine(Directory, entry.StoredFile)));
+            TryDelete(Path.Combine(RootDirectory, id + ".json"));
+            TryDelete(Path.GetFullPath(Path.Combine(RootDirectory, entry.StoredFile)));
             lock (_sync) _pathToId.Remove(entry.OriginalPath);
             return true;
         }
@@ -201,7 +202,7 @@ namespace DLP.UsbController.Services
 
         private IEnumerable<string> SafeEnumerate(string pattern)
         {
-            try { return Directory.EnumerateFiles(this.Directory, pattern).ToList(); }
+            try { return System.IO.Directory.EnumerateFiles(RootDirectory, pattern).ToList(); }
             catch (IOException) { return []; }
             catch (UnauthorizedAccessException) { return []; }
         }
@@ -219,7 +220,7 @@ namespace DLP.UsbController.Services
             if (!OperatingSystem.IsWindows()) return;
             try
             {
-                var dirInfo = new DirectoryInfo(Directory);
+                var dirInfo = new DirectoryInfo(RootDirectory);
                 var sec = dirInfo.GetAccessControl();
                 sec.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
                 sec.AddAccessRule(new System.Security.AccessControl.FileSystemAccessRule(
